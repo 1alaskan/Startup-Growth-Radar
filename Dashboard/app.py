@@ -6,6 +6,7 @@ and presents a ranked, filterable view of ~846 startups.
 """
 
 import io
+from datetime import datetime, timezone
 
 import boto3
 import pandas as pd
@@ -152,66 +153,62 @@ def _get_s3_client():
     )
 
 
-@st.cache_data(ttl=3600)
-def read_csv_from_s3(key: str) -> pd.DataFrame:
-    """Read a CSV from S3, handling both flat files and Spark directory output."""
-    s3 = _get_s3_client()
+def _resolve_latest_key(key: str, extension: str) -> tuple[str, "datetime | None"]:
+    """Return (S3 key, LastModified) of the newest file matching the prefix.
 
-    # Check if it's a Spark directory (contains part-* files)
+    Handles both flat files at `key` and Spark directory output under `key/`.
+    Picks the most recently modified part file so weekly Spark reruns are
+    picked up even when prior runs leave older part files behind.
+    """
+    s3 = _get_s3_client()
     resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=key)
     contents = resp.get("Contents", [])
 
-    # Find the actual data file (part-*.csv), excluding _SUCCESS and metadata
-    csv_files = [
-        obj["Key"]
-        for obj in contents
-        if obj["Key"].endswith(".csv") and "/_" not in obj["Key"]
+    matches = [
+        obj for obj in contents
+        if obj["Key"].endswith(extension) and "/_" not in obj["Key"]
     ]
 
-    if csv_files:
-        # Spark directory style — read the part file
-        target_key = csv_files[0]
-    else:
-        # Flat file
-        target_key = key
+    if not matches:
+        return key, None
 
-    obj = s3.get_object(Bucket=BUCKET, Key=target_key)
-    return pd.read_csv(io.BytesIO(obj["Body"].read()))
+    newest = max(matches, key=lambda o: o["LastModified"])
+    return newest["Key"], newest["LastModified"]
 
 
 @st.cache_data(ttl=3600)
-def read_parquet_from_s3(key: str) -> pd.DataFrame:
-    """Read a Parquet from S3, handling Spark directory output."""
+def read_csv_from_s3(key: str) -> tuple[pd.DataFrame, "datetime | None"]:
+    """Read newest CSV under `key`, returning (df, last_modified)."""
+    target_key, last_modified = _resolve_latest_key(key, ".csv")
     s3 = _get_s3_client()
-
-    resp = s3.list_objects_v2(Bucket=BUCKET, Prefix=key)
-    contents = resp.get("Contents", [])
-
-    pq_files = [
-        obj["Key"]
-        for obj in contents
-        if obj["Key"].endswith(".parquet") and "/_" not in obj["Key"]
-    ]
-
-    target_key = pq_files[0] if pq_files else key
     obj = s3.get_object(Bucket=BUCKET, Key=target_key)
-    return pd.read_parquet(io.BytesIO(obj["Body"].read()))
+    return pd.read_csv(io.BytesIO(obj["Body"].read())), last_modified
+
+
+@st.cache_data(ttl=3600)
+def read_parquet_from_s3(key: str) -> tuple[pd.DataFrame, "datetime | None"]:
+    """Read newest Parquet under `key`, returning (df, last_modified)."""
+    target_key, last_modified = _resolve_latest_key(key, ".parquet")
+    s3 = _get_s3_client()
+    obj = s3.get_object(Bucket=BUCKET, Key=target_key)
+    return pd.read_parquet(io.BytesIO(obj["Body"].read())), last_modified
 
 
 @st.cache_data(ttl=3600)
 def load_all_data() -> dict:
     """Load all datasets from S3 and return as a dictionary."""
-    scores = read_csv_from_s3(S3_KEYS["scores"])
-    hiring = read_csv_from_s3(S3_KEYS["hiring"])
-    features = read_parquet_from_s3(S3_KEYS["features"])
-    metadata = read_csv_from_s3(S3_KEYS["metadata"])
-    spine = read_parquet_from_s3(S3_KEYS["spine"])
+    scores, scores_mtime = read_csv_from_s3(S3_KEYS["scores"])
+    hiring, _ = read_csv_from_s3(S3_KEYS["hiring"])
+    features, _ = read_parquet_from_s3(S3_KEYS["features"])
+    metadata, _ = read_csv_from_s3(S3_KEYS["metadata"])
+    spine, _ = read_parquet_from_s3(S3_KEYS["spine"])
     return {
         "scores": scores,
         "hiring": hiring,
         "features": features,
         "metadata": metadata,
         "spine": spine,
+        "last_updated": scores_mtime,
     }
 
 
@@ -583,9 +580,30 @@ def render_overview_tab(data: dict, master_df: pd.DataFrame):
 
 def main():
     st.title("Startup Growth Radar")
+
+    # Load data
+    try:
+        data = load_all_data()
+    except Exception as e:
+        st.error(f"Could not load data from S3: {e}")
+        st.info("Check that AWS credentials are configured in .streamlit/secrets.toml")
+        st.stop()
+
+    last_updated = data.get("last_updated")
+    if last_updated is not None:
+        age = datetime.now(timezone.utc) - last_updated
+        age_days = age.days
+        ts_str = last_updated.strftime("%Y-%m-%d %H:%M UTC")
+        freshness = (
+            f"Data last refreshed by AWS pipeline: <b>{ts_str}</b> "
+            f"({age_days} day{'s' if age_days != 1 else ''} ago)"
+        )
+    else:
+        freshness = "Data freshness unknown — could not read S3 LastModified."
+
     st.markdown(
         '<div class="weekly-banner">'
-        "This dashboard updates automatically every week. "
+        f"{freshness}<br>"
         "An AWS pipeline (Step Functions + EMR Serverless) rescores all companies "
         "each Monday and writes fresh results to S3."
         "</div>",
@@ -599,20 +617,16 @@ def main():
     )
     st.caption("Ranked by hiring friendliness score")
 
-    # Load data
-    try:
-        data = load_all_data()
-    except Exception as e:
-        st.error(f"Could not load data from S3: {e}")
-        st.info("Check that AWS credentials are configured in .streamlit/secrets.toml")
-        st.stop()
-
     master_df = prepare_master_table(data)
     total_count = len(master_df)
 
     # ── Sidebar filters ──────────────────────────────────────────────────
 
     st.sidebar.title("Filters")
+
+    if st.sidebar.button("🔄 Refresh data from S3", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
 
     min_score = st.sidebar.slider("Minimum Hiring Score", 0, 100, 0, step=5)
 
