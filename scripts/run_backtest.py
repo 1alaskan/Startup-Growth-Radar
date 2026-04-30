@@ -16,8 +16,12 @@ from pathlib import Path
 
 import pandas as pd
 
-# Make the evaluation package importable when running this script directly.
-ROOT = Path(__file__).resolve().parent.parent
+# Locate the repo root regardless of where this script lives (root or scripts/).
+HERE = Path(__file__).resolve().parent
+ROOT = next(
+    (p for p in [HERE, *HERE.parents] if (p / "evaluation").is_dir()),
+    HERE,
+)
 sys.path.insert(0, str(ROOT))
 
 from evaluation.features import FeatureSpec
@@ -66,6 +70,7 @@ CUTOFFS = pd.date_range(end=pd.Timestamp.today() - pd.Timedelta(days=90),
                         periods=6, freq="-3MS")[::-1]
 
 OUT_DIR = ROOT / "evaluation_artifacts"
+OUT_DIR.mkdir(exist_ok=True)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
