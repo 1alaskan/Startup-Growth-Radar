@@ -9,3 +9,6 @@ __pycache__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Evaluation outputs (large; uploaded to S3 instead)
+evaluation_artifacts/*.parquet
