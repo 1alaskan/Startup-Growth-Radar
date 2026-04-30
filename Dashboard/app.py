@@ -102,6 +102,14 @@ S3_KEYS = {
     "spine": "cleaned/spine_cleaned.parquet",
 }
 
+# Walk-forward evaluation artifacts written by evaluation.runner.run_evaluation.
+# Tabs that depend on these degrade gracefully when the files don't exist yet.
+EVAL_S3_KEYS = {
+    "per_fold": "evaluation/per_fold.parquet",
+    "summary": "evaluation/summary.parquet",
+    "scores": "evaluation/scores.parquet",
+}
+
 FUNDING_STAGE_LABELS = {
     0.0: "Pre-Seed / Angel",
     1.0: "Seed",
@@ -210,6 +218,22 @@ def load_all_data() -> dict:
         "spine": spine,
         "last_updated": scores_mtime,
     }
+
+
+@st.cache_data(ttl=3600)
+def load_evaluation_artifacts() -> dict:
+    """Load walk-forward backtest output. Missing files yield None entries."""
+    out: dict = {"per_fold": None, "summary": None, "scores": None, "last_updated": None}
+    for name, key in EVAL_S3_KEYS.items():
+        try:
+            df, mtime = read_parquet_from_s3(key)
+            out[name] = df
+            if out["last_updated"] is None or (mtime and mtime > out["last_updated"]):
+                out["last_updated"] = mtime
+        except Exception:
+            # File not uploaded yet — tab will render an empty-state message.
+            out[name] = None
+    return out
 
 
 # ── Data preparation ─────────────────────────────────────────────────────────
@@ -504,6 +528,208 @@ def render_company_detail(company_id: str, data: dict, master_df: pd.DataFrame):
                     st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 
+# ── Evaluation tabs (walk-forward backtest) ──────────────────────────────────
+
+
+def _eval_empty_state(missing: list[str]):
+    """Render a placeholder when evaluation parquets aren't uploaded yet."""
+    st.info(
+        "Walk-forward backtest results aren't available yet. "
+        f"Missing S3 files: `{', '.join(missing)}`.\n\n"
+        "Run `evaluation.runner.run_evaluation(...)` and upload the resulting "
+        "parquets to `s3://startup-momentum-pipeline/evaluation/`."
+    )
+
+
+def render_backtest_tab(eval_data: dict):
+    """Headline mean±std table + per-fold stability lines."""
+    summary = eval_data.get("summary")
+    per_fold = eval_data.get("per_fold")
+    if summary is None or per_fold is None:
+        missing = [k for k in ("summary", "per_fold") if eval_data.get(k) is None]
+        _eval_empty_state(missing)
+        return
+
+    headline_metrics = ["pr_auc", "precision_at_10", "precision_at_20", "lift_at_10", "recall_at_50"]
+    headline = summary[summary["metric"].isin(headline_metrics)].copy()
+    headline["cell"] = headline.apply(
+        lambda r: f"{r['mean']:.3f} ± {r['std']:.3f}", axis=1
+    )
+    table = (
+        headline.pivot(index="model", columns="metric", values="cell")
+        .reindex(columns=[m for m in headline_metrics if m in headline["metric"].values])
+    )
+    st.markdown("#### Mean ± Std across folds")
+    st.dataframe(table, use_container_width=True)
+
+    st.markdown("#### Per-fold stability")
+    metric_choice = st.selectbox(
+        "Metric",
+        options=sorted(per_fold["metric"].unique()),
+        index=sorted(per_fold["metric"].unique()).index("precision_at_20")
+        if "precision_at_20" in per_fold["metric"].unique() else 0,
+    )
+    pivot = (
+        per_fold[per_fold["metric"] == metric_choice]
+        .pivot(index="cutoff", columns="model", values="value")
+        .reset_index()
+    )
+    fig = px.line(
+        pivot.melt(id_vars="cutoff", var_name="model", value_name=metric_choice),
+        x="cutoff", y=metric_choice, color="model", markers=True,
+    )
+    fig.update_layout(height=400, margin=dict(l=40, r=20, t=20, b=40))
+    st.plotly_chart(fig, use_container_width=True)
+
+
+def render_hits_tab(eval_data: dict, master_df: pd.DataFrame, data: dict):
+    """Feed of true positives: companies the model flagged that then raised."""
+    scores = eval_data.get("scores")
+    if scores is None:
+        _eval_empty_state(["scores"])
+        return
+
+    model_options = sorted(scores["model"].unique())
+    default_model = "xgboost" if "xgboost" in model_options else model_options[0]
+    chosen_model = st.selectbox("Model", options=model_options, index=model_options.index(default_model))
+    top_k = st.slider("Surface top-K per fold", min_value=5, max_value=50, value=20, step=5)
+
+    s = scores[scores["model"] == chosen_model].copy()
+    s["as_of_date"] = pd.to_datetime(s["as_of_date"])
+    # Within each fold, take the top-k by score.
+    s["rank_in_fold"] = s.groupby("as_of_date")["score"].rank(method="first", ascending=False)
+    surfaced = s[s["rank_in_fold"] <= top_k]
+
+    # A "hit" = surfaced AND label==1 (raised in the 90-day window).
+    hits = surfaced[surfaced["label"] == 1].copy()
+    if hits.empty:
+        st.warning("No true-positive hits in the current selection.")
+        return
+
+    # Compute lead time: first cutoff at which this company crossed into top-k,
+    # joined to the actual round date from the spine.
+    first_surfaced = (
+        surfaced[surfaced["label"] == 1]
+        .groupby("company_id")["as_of_date"].min()
+        .rename("first_surfaced")
+    )
+
+    spine = data["spine"][["company_id"]].copy()
+    if "last_funding_date" in data["spine"].columns:
+        spine["round_date"] = pd.to_datetime(
+            data["spine"]["last_funding_date"], errors="coerce"
+        )
+    else:
+        spine["round_date"] = pd.NaT
+
+    if "last_funding_type" in data["spine"].columns:
+        spine["round_type"] = data["spine"]["last_funding_type"]
+
+    feed = (
+        first_surfaced.to_frame()
+        .join(
+            hits.sort_values("score", ascending=False)
+            .drop_duplicates("company_id")
+            .set_index("company_id")[["score"]]
+            .rename(columns={"score": "best_score"}),
+            how="left",
+        )
+        .join(spine.set_index("company_id"), how="left")
+        .reset_index()
+    )
+
+    # Add company name + funding stage from the master table.
+    feed = feed.merge(
+        master_df[["company_id", "name", "primary_industry", "funding_stage_label", "website"]],
+        on="company_id", how="left",
+    )
+
+    feed["lead_time_days"] = (feed["round_date"] - feed["first_surfaced"]).dt.days
+    feed = feed.sort_values("first_surfaced", ascending=False)
+
+    # KPI strip
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("Hit count", len(feed))
+    with c2:
+        med_lead = feed["lead_time_days"].dropna()
+        st.metric("Median lead time", f"{med_lead.median():.0f} d" if len(med_lead) else "N/A")
+    with c3:
+        st.metric("Best score", f"{feed['best_score'].max():.3f}")
+
+    st.markdown("#### Hits feed")
+    show_cols = {
+        "first_surfaced": "First surfaced",
+        "name": "Company",
+        "best_score": "Score",
+        "round_date": "Round date",
+        "round_type": "Round",
+        "lead_time_days": "Lead (d)",
+        "primary_industry": "Industry",
+        "funding_stage_label": "Stage",
+        "website": "Website",
+    }
+    available = {k: v for k, v in show_cols.items() if k in feed.columns}
+    display = feed[list(available.keys())].rename(columns=available)
+    st.dataframe(
+        display,
+        column_config={
+            "Score": st.column_config.NumberColumn(format="%.3f"),
+            "Lead (d)": st.column_config.NumberColumn(format="%d"),
+            "Website": st.column_config.LinkColumn(),
+        },
+        hide_index=True, use_container_width=True, height=500,
+    )
+
+
+def render_calibration_tab(eval_data: dict):
+    """Decile reliability diagram on the held-out scores frame."""
+    scores = eval_data.get("scores")
+    if scores is None:
+        _eval_empty_state(["scores"])
+        return
+
+    model_options = sorted(scores["model"].unique())
+    default_model = "xgboost" if "xgboost" in model_options else model_options[0]
+    chosen = st.selectbox(
+        "Model", options=model_options,
+        index=model_options.index(default_model), key="calib_model",
+    )
+    n_bins = st.slider("Bins", min_value=5, max_value=20, value=10)
+
+    s = scores[scores["model"] == chosen].copy()
+    if s["score"].nunique() < n_bins:
+        st.warning("Not enough unique scores to bin — try fewer bins or a different model.")
+        return
+
+    edges = pd.qcut(s["score"], q=n_bins, duplicates="drop", retbins=True)[1]
+    s["bin"] = pd.cut(s["score"], bins=edges, include_lowest=True, labels=False)
+    curve = (
+        s.groupby("bin")
+        .agg(predicted=("score", "mean"), observed=("label", "mean"), n=("label", "size"))
+        .reset_index()
+    )
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=[0, curve["predicted"].max()], y=[0, curve["predicted"].max()],
+        mode="lines", line=dict(dash="dash", color="gray"), name="perfect",
+    ))
+    fig.add_trace(go.Scatter(
+        x=curve["predicted"], y=curve["observed"], mode="lines+markers",
+        name=chosen, line=dict(color="#2563eb"),
+    ))
+    fig.update_layout(
+        xaxis_title="Mean predicted score (bin)",
+        yaxis_title="Observed positive rate",
+        height=450, margin=dict(l=40, r=20, t=20, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Bin detail")
+    st.dataframe(curve, hide_index=True, use_container_width=True)
+
+
 def render_overview_tab(data: dict, master_df: pd.DataFrame):
     """Render the Data Overview tab with distribution charts."""
     c1, c2 = st.columns(2)
@@ -653,7 +879,21 @@ def main():
 
     # ── Tabs ─────────────────────────────────────────────────────────────
 
-    tab_rankings, tab_overview = st.tabs(["Company Rankings", "Data Overview"])
+    eval_data = load_evaluation_artifacts()
+
+    (
+        tab_rankings,
+        tab_overview,
+        tab_backtest,
+        tab_hits,
+        tab_calibration,
+    ) = st.tabs([
+        "Company Rankings",
+        "Data Overview",
+        "Backtest Results",
+        "Hits Feed",
+        "Calibration",
+    ])
 
     with tab_rankings:
         render_kpi_cards(filtered_df, total_count)
@@ -679,6 +919,15 @@ def main():
 
     with tab_overview:
         render_overview_tab(data, master_df)
+
+    with tab_backtest:
+        render_backtest_tab(eval_data)
+
+    with tab_hits:
+        render_hits_tab(eval_data, master_df, data)
+
+    with tab_calibration:
+        render_calibration_tab(eval_data)
 
 
 if __name__ == "__main__":
